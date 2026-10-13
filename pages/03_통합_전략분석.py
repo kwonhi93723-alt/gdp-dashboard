@@ -1,5 +1,6 @@
 """Menswear Intel v3: add as pages/03_통합_전략분석.py in the existing Streamlit repository."""
 import io
+import base64
 import json
 import re
 import time
@@ -201,10 +202,69 @@ def report_html(df,season,notes):
             '<h2>기획 제안의 검증 절차</h2><p>1. 시즌·품번 검증 → 2. 브랜드별 수집 범위 일치 → 3. 가격·소재 원문 검증 → 4. 닥스 판매/재고 및 MD 의견 대조 → 5. 개발 우선순위 결정</p>'
             '<p class="muted">자동 분석은 의사결정 보조 자료입니다. 수집 누락과 시즌 미확인 데이터를 주의하세요.</p></body></html>')
 
+# Optional persistence in a GitHub repository. Configure secrets in Streamlit Cloud.
+def github_config():
+    try:
+        token=st.secrets.get('GITHUB_TOKEN','')
+        repo=st.secrets.get('GITHUB_DATA_REPO','')
+        branch=st.secrets.get('GITHUB_DATA_BRANCH','main')
+        return str(token),str(repo),str(branch)
+    except Exception:
+        return '','','main'
+
+def github_request(method, payload=None, sha=None):
+    token,repo,branch=github_config()
+    if not (token and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',repo)):
+        raise RuntimeError('GitHub 저장소 연결이 설정되지 않았습니다.')
+    url=f'https://api.github.com/repos/{repo}/contents/data/menswear_public_products.csv'
+    headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+    if method=='GET':
+        r=requests.get(url,headers=headers,params={'ref':branch},timeout=20)
+        if r.status_code==404:return None
+        r.raise_for_status()
+        return r.json()
+    body={'message':'Update Menswear Intel public product snapshots','content':base64.b64encode(payload).decode(),'branch':branch}
+    if sha:body['sha']=sha
+    r=requests.put(url,headers=headers,json=body,timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def load_remote():
+    obj=github_request('GET')
+    if obj is None:return pd.DataFrame(columns=COLS)
+    content=base64.b64decode(obj['content'])
+    return standardize(pd.read_csv(io.BytesIO(content),encoding='utf-8-sig'))[COLS]
+
+def save_remote(frame):
+    # Never persist uploaded internal data; only public crawls and public samples.
+    obj=github_request('GET')
+    old=pd.DataFrame(columns=COLS) if obj is None else standardize(pd.read_csv(io.BytesIO(base64.b64decode(obj['content'])),encoding='utf-8-sig'))[COLS]
+    merged=standardize(pd.concat([old,frame],ignore_index=True))[COLS]
+    payload=merged.to_csv(index=False).encode('utf-8-sig')
+    github_request('PUT',payload,sha=obj['sha'] if obj else None)
+    return len(merged)
+
+def add_public(frame):
+    old=st.session_state.get('v3_crawl',pd.DataFrame(columns=COLS))
+    st.session_state['v3_crawl']=standardize(pd.concat([old,frame],ignore_index=True))[COLS]
+    token,repo,_=github_config()
+    if token and repo:
+        try:
+            n=save_remote(frame)
+            st.success(f'GitHub 저장소에 공개 상품 누적 저장 완료: {n}건')
+        except Exception as e:
+            st.error(f'GitHub 저장 실패: {type(e).__name__} — CSV 백업을 다운로드해 주세요.')
+
 st.set_page_config(page_title='Menswear Intel v3 통합 전략',page_icon='📊',layout='wide')
 st.title('📊 Menswear Intel v3 | 통합 전략 분석')
 st.caption('수집 → 정제 → 경쟁사 비교 → 인사이트 → 시즌별 상품기획 리포트')
-st.warning('공개 Streamlit 앱에는 사내 매출·원가·고객정보를 업로드하지 마세요. 이 페이지의 업로드는 세션 메모리에서만 처리하며 영구 DB에 저장하지 않습니다.')
+st.warning('공개 Streamlit 앱에는 사내 매출·원가·고객정보를 업로드하지 마세요. GitHub 저장은 공개몰 수집 데이터에만 적용됩니다.')
+if 'v3_remote_checked' not in st.session_state:
+    st.session_state['v3_remote_checked']=True
+    token,repo,_=github_config()
+    if token and repo:
+        try:st.session_state['v3_crawl']=load_remote()
+        except Exception as e:st.warning(f'저장 데이터 불러오기 실패: {type(e).__name__}')
 
 with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐색)',expanded=False):
     st.caption('기존 v2 수집 페이지는 유지됩니다. 이 기능은 목록 페이지를 우선 탐색하지만 전체 상품 수집을 보장하지 않습니다.')
@@ -215,7 +275,8 @@ with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐
     if st.button('카테고리 우선 수집 실행',type='primary'):
         with st.spinner('공식몰 공개 페이지를 확인하고 있습니다...'):
             data,logs,stats=crawl(brand,pages,delay,extra)
-        st.session_state['v3_crawl']=data
+        # Keep earlier brands in the current browser session instead of overwriting.
+        add_public(data)
         st.session_state['v3_logs']=logs
         st.session_state['v3_stats']=stats
     if 'v3_stats' in st.session_state:
@@ -226,7 +287,31 @@ with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐
         with st.expander('수집 로그'):st.code('\n'.join(st.session_state['v3_logs']))
 
 st.subheader('② 데이터 통합 및 품질 확인')
-st.caption('v2에서 받은 CSV와 닥스 상품 CSV를 함께 업로드할 수 있습니다. 기존 v2 수집 결과는 자동 공유되지 않으므로 CSV로 저장한 뒤 올려주세요.')
+st.caption('브랜드별 수집 결과는 세션에 누적됩니다. GitHub Secrets를 설정하면 공개 상품만 별도 저장소에 자동 보관하고 재접속 시 복원합니다. 설정하지 않으면 CSV 백업이 필요합니다.')
+with st.expander('💾 데이터 영구 보관 상태 / 복원'):
+    token,repo,_=github_config()
+    st.write('GitHub 저장 연결: '+('설정됨 ('+repo+')' if token and repo else '미설정 — 세션 종료 시 데이터가 사라질 수 있습니다.'))
+    if token and repo and st.button('저장된 공개 상품 다시 불러오기'):
+        try:add=load_remote();st.session_state['v3_crawl']=standardize(pd.concat([st.session_state.get('v3_crawl',pd.DataFrame(columns=COLS)),add],ignore_index=True))[COLS];st.success(f'복원 완료: {len(add)}건')
+        except Exception as e:st.error(f'복원 실패: {type(e).__name__}')
+st.info('닥스는 LF몰 공개 검색결과에서 확인된 2026-10-13 스냅샷 6건을 제공합니다. 특정 검색어의 편향된 표본이므로 전체 브랜드 구성비나 시즌별 상품 공백 판단에 사용하면 안 됩니다.')
+# Verified public LFmall search snapshot, 2026-10-13. These are search hits, not the entire DAKS assortment.
+DAKS_PUBLIC = [
+ ('닥스','미확인','티셔츠','[EXCLUSIVE] 다크 블루 기모 마이크로 투톤 카라넥 티셔츠','','185490','','','','https://m.lfmall.co.kr/app/search/result/LF%EB%AA%B0DAKS%EB%B8%94%EB%A3%A8','LF몰 검색 스냅샷 2026-10-13','2026-10-13','공개 검색결과 · 판매가'),
+ ('닥스','미확인','셔츠','[EXCLUSIVE] 블루 고밀도 데님 세미 오버 핏 셔츠','','169290','','면','','https://m.lfmall.co.kr/app/search/result/LF%EB%AA%B0DAKS%EB%B8%94%EB%A3%A8','LF몰 검색 스냅샷 2026-10-13','2026-10-13','공개 검색결과 · 판매가'),
+ ('닥스','미확인','셔츠','[EXCLUSIVE] 라이트블루 린넨100% 닥스훈트 반팔 셔츠','','112770','','린넨','린넨100%','https://m.lfmall.co.kr/app/search/result/LF%EB%AA%B0DAKS%EB%B8%94%EB%A3%A8','LF몰 검색 스냅샷 2026-10-13','2026-10-13','공개 검색결과 · 판매가'),
+ ('닥스','미확인','팬츠','[EXCLUSIVE] 라이트블루 스트레치 치노 팬츠','','125370','','','','https://m.lfmall.co.kr/app/search/result/LF%EB%AA%B0DAKS%EB%B8%94%EB%A3%A8','LF몰 검색 스냅샷 2026-10-13','2026-10-13','공개 검색결과 · 판매가'),
+ ('닥스','미확인','티셔츠','[EXCLUSIVE] 블루 링클프리 마이크로 반팔 티셔츠','','125370','','','','https://m.lfmall.co.kr/app/search/result/LF%EB%AA%B0DAKS%EB%B8%94%EB%A3%A8','LF몰 검색 스냅샷 2026-10-13','2026-10-13','공개 검색결과 · 판매가'),
+ ('닥스','미확인','셔츠','[EXCLUSIVE] 블루 시어서커 스트라이프 반팔 셔츠','','112770','','','','https://m.lfmall.co.kr/app/search/result/LF%EB%AA%B0DAKS%EB%B8%94%EB%A3%A8','LF몰 검색 스냅샷 2026-10-13','2026-10-13','공개 검색결과 · 판매가'),
+]
+daks_public_df=pd.DataFrame(DAKS_PUBLIC,columns=COLS)
+st.download_button('닥스 공개 검색 스냅샷 CSV 다운로드 (6건)',daks_public_df.to_csv(index=False).encode('utf-8-sig'),file_name='daks_public_sample_2026_10.csv',mime='text/csv')
+if st.button('닥스 공개 검색 스냅샷 6건 비교에 추가'):
+    old=st.session_state.get('v3_crawl',pd.DataFrame(columns=COLS))
+    st.session_state['v3_crawl']=pd.concat([old,daks_public_df],ignore_index=True).drop_duplicates(subset=['brand','product_name','url'],keep='last').reset_index(drop=True)
+    st.success('닥스 공개 샘플을 현재 세션에 추가했습니다.')
+if 'v3_crawl' in st.session_state and not st.session_state['v3_crawl'].empty:
+    st.download_button('현재 누적 수집 결과 백업 CSV',st.session_state['v3_crawl'][COLS].to_csv(index=False).encode('utf-8-sig'),file_name='menswear_intel_all_brands_backup.csv',mime='text/csv')
 files=st.file_uploader('상품 CSV 업로드 (여러 개 선택 가능)',type=['csv'],accept_multiple_files=True,key='v3_upload')
 frames=[]
 if 'v3_crawl' in st.session_state and not st.session_state['v3_crawl'].empty:frames.append(st.session_state['v3_crawl'])
@@ -248,6 +333,8 @@ if frames:
     a.metric('표본 스타일/SKU',len(view));b.metric('브랜드',view.brand.nunique());c.metric('시즌 확인율',f"{(view.season!='미확인').mean():.0%}" if len(view) else '—');d.metric('가격 확보율',f"{view.price.notna().mean():.0%}" if len(view) else '—')
     st.caption('품번이 없으면 URL 또는 상품명으로 중복 제거합니다. 동일 디자인의 컬러별 SKU는 합쳐지지 않을 수 있습니다.')
     st.dataframe(view[['brand','season','category','product_name','product_id','price','material','data_quality','url']],use_container_width=True,hide_index=True)
+    if '닥스' in view.brand.values and view.brand.nunique()>1:
+        st.warning('닥스는 특정 검색어에서 얻은 6건의 편향 표본입니다. 경쟁사와 구성비·상품 공백을 동등한 모집단으로 비교할 수 없습니다. 아래 비교는 탐색용입니다.')
     st.subheader('③ 브랜드별 상품 구성')
     count=pd.crosstab(view['category'],view['brand'])
     if not count.empty:
