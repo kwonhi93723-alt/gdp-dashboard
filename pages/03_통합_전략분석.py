@@ -1,9 +1,10 @@
-"""Menswear Intel v3.4 — Streamlit page: pages/03_통합_전략분석.py."""
+"""Menswear Intel v3.5 — Streamlit page: pages/03_통합_전략분석.py."""
 import base64
 import io
 import json
 import re
 import time
+from urllib.parse import urlsplit
 from collections import deque
 from datetime import datetime, timezone
 from html import escape
@@ -32,7 +33,7 @@ CATEGORY_RULES = [
 ]
 MATERIALS = ['캐시미어', '울', '모헤어', '알파카', '린넨', '리넨', '면', '코튼', '실크',
              '폴리에스터', '나일론', '레이온', '비스코스', '스판', '라이오셀', '텐셀', '가죽', '스웨이드', '다운']
-HEADERS = {'User-Agent': 'MenswearIntelResearch/3.4 (public pages, low request rate)'}
+HEADERS = {'User-Agent': 'MenswearIntelResearch/3.5 (public pages, low request rate)'}
 REMOTE_PATH = 'data/menswear_public_products.csv'
 HISTORY_PATH = 'data/menswear_public_history.csv'
 
@@ -100,6 +101,107 @@ def objects(value):
             yield from objects(child)
 
 
+# A composition is a verified fiber + percentage, not a marketing description.
+FIBER_PATTERN = (r'(?:울|모|양모|캐시미어|면|코튼|린넨|리넨|마|실크|견|'
+                 r'폴리에스터|폴리에스테르|폴리|나일론|레이온|비스코스|'
+                 r'스판덱스|폴리우레탄|아크릴|라이오셀|텐셀|모달|'
+                 r'WOOL|CASHMERE|COTTON|LINEN|SILK|POLYESTER|NYLON|'
+                 r'RAYON|VISCOSE|ELASTANE|SPANDEX|ACRYLIC|LYOCELL)')
+COMPOSITION_RE = re.compile(
+    rf'({FIBER_PATTERN})\s*[:：]?\s*(\d{{1,3}}(?:\.\d+)?)\s*[%％]', re.I)
+REVERSE_COMPOSITION_RE = re.compile(
+    rf'(\d{{1,3}}(?:\.\d+)?)\s*[%％]\s*({FIBER_PATTERN})', re.I)
+
+
+def composition_of(text):
+    """Extract explicit fiber percentages; do not infer blends from descriptions."""
+    value = clean_text(text)
+    if not value:
+        return ''
+    hits = []
+    for match in COMPOSITION_RE.finditer(value):
+        hits.append((match.start(), match.group(1), match.group(2)))
+    forward_spans = [match.span() for match in COMPOSITION_RE.finditer(value)]
+    for match in REVERSE_COMPOSITION_RE.finditer(value):
+        if any(match.start() < end and match.end() > start for start, end in forward_spans):
+            continue
+        hits.append((match.start(), match.group(2), match.group(1)))
+    hits.sort(key=lambda x: x[0])
+    seen, parts = set(), []
+    for _, fiber, percent in hits:
+        n = float(percent)
+        if not 0 < n <= 100:
+            continue
+        fiber = fiber.strip()
+        key = (fiber.lower(), n)
+        if key not in seen:
+            seen.add(key)
+            parts.append(f'{fiber} {percent}%')
+    return ', '.join(parts[:12])
+
+
+def detail_text(soup):
+    """Visible page text plus metadata, including public product specifications."""
+    chunks = [soup.get_text(' ', strip=True)]
+    for tag in soup.select('meta[content], [data-material], [data-composition]'):
+        for attr in ('content', 'data-material', 'data-composition'):
+            if tag.get(attr):
+                chunks.append(str(tag[attr]))
+    return ' '.join(chunks)[:250000]
+
+
+def image_composition(soup, page_url, session, max_images=2):
+    """Optional last resort. Requires Pillow, pytesseract and Korean Tesseract data.
+
+    Only scan a few images from a user-initiated crawl, never all page images.
+    """
+    try:
+        import pytesseract
+        from PIL import Image, ImageOps
+        if 'kor' not in pytesseract.get_languages(config=''):
+            return '', '한국어 OCR 언어팩(kor) 없음'
+    except (ImportError, OSError):
+        return '', 'OCR 의존성 없음 (Pillow/pytesseract/Tesseract kor)'
+    candidates = []
+    for tag in soup.select('img[src], img[data-src], img[data-original]'):
+        src = tag.get('data-original') or tag.get('data-src') or tag.get('src') or ''
+        target = urljoin(page_url, src)
+        if urlsplit(target).scheme not in ('https', 'http'):
+            continue
+        if target not in candidates:
+            candidates.append(target)
+    checked = 0
+    for target in candidates:
+        if checked >= max_images:
+            break
+        try:
+            # Image requests are bounded; avoid downloading unbounded assets.
+            response = session.get(target, timeout=10, stream=True)
+            response.raise_for_status()
+            if not response.headers.get('Content-Type', '').lower().startswith('image/'):
+                response.close()
+                continue
+            payload = bytearray()
+            for chunk in response.iter_content(chunk_size=65536):
+                payload.extend(chunk)
+                if len(payload) > 4_000_000:
+                    break
+            response.close()
+            if len(payload) > 4_000_000:
+                continue
+            image = Image.open(io.BytesIO(payload))
+            if image.width < 500 or image.height < 300 or image.width * image.height > 15_000_000:
+                continue
+            checked += 1
+            text = pytesseract.image_to_string(ImageOps.grayscale(image), lang='kor+eng', timeout=12)
+            found = composition_of(text)
+            if found:
+                return found, f'OCR 이미지 {checked}개 검사 후 발견 (원문 확인 필요)'
+        except Exception:
+            continue
+    return '', f'OCR 이미지 {checked}개 검사, 혼용률 미발견'
+
+
 def extract(soup, url, brand, source_category):
     rows = []
     for tag in soup.select('script[type="application/ld+json"]'):
@@ -127,7 +229,7 @@ def extract(soup, url, brand, source_category):
                 brand=brand, season=season_of(' '.join([name, description, product_id, product_url])),
                 category=category_of(source_category + ' ' + name), product_name=name,
                 product_id=product_id, price=number(offers.get('price') or offers.get('lowPrice')),
-                list_price=None, material=materials, composition=description[:500],
+                list_price=None, material=materials, composition=composition_of(description),
                 url=product_url, source_category=source_category,
                 collected_at=datetime.now(timezone.utc).isoformat(), evidence='Product JSON-LD'))
     return rows
@@ -158,7 +260,7 @@ def extract_product_meta(soup, url, brand, source_category):
     return [dict(brand=brand, season=season_of(' '.join([title, description, product_id, product_url])),
                  category=category_of(source_category + ' ' + title), product_name=title,
                  product_id=product_id, price=number(price), list_price=None,
-                 material=material, composition=description[:500], url=product_url,
+                 material=material, composition=composition_of(description), url=product_url,
                  source_category=source_category, collected_at=datetime.now(timezone.utc).isoformat(),
                  evidence='상품 상세 메타태그 (검증 필요)')]
 
@@ -181,7 +283,7 @@ def link_kind(url, brand):
     return None
 
 
-def crawl(brand, max_pages=60, delay=1.5, extra=''):
+def crawl(brand, max_pages=60, delay=1.5, extra='', use_ocr=False):
     root, domain = BRANDS[brand]
     listings = deque([(root, '브랜드 메인')])
     products = deque()
@@ -191,6 +293,9 @@ def crawl(brand, max_pages=60, delay=1.5, extra=''):
     detail_visited = 0
     jsonld_found = 0
     meta_found = 0
+    composition_html_found = 0
+    composition_ocr_found = 0
+    ocr_notes = []
     listing_streak = 0
     for raw in extra.splitlines():
         url = urldefrag(raw.strip())[0]
@@ -232,6 +337,22 @@ def crawl(brand, max_pages=60, delay=1.5, extra=''):
             elif is_detail:
                 found = extract_product_meta(soup, response.url, brand, source)
                 meta_found += len(found)
+            if found and is_detail:
+                page_text = detail_text(soup)
+                for record in found:
+                    if not record.get('composition'):
+                        record['composition'] = composition_of(page_text)
+                        if record['composition']:
+                            record['evidence'] += ' + 상세 HTML 혼용률'
+                            composition_html_found += 1
+                    if not record.get('composition') and use_ocr:
+                        comp, note = image_composition(soup, response.url, session)
+                        if comp:
+                            record['composition'] = comp
+                            record['evidence'] += ' + 이미지 OCR(검증 필요)'
+                            composition_ocr_found += 1
+                        if len(ocr_notes) < 12:
+                            ocr_notes.append(f'{record.get("product_id") or response.url}: {note}')
             rows.extend(found)
             discovered = 0
             for anchor in soup.select('a[href]'):
@@ -259,7 +380,8 @@ def crawl(brand, max_pages=60, delay=1.5, extra=''):
                          'listing_queue_remaining': len(listings),
                          'product_queue_remaining': len(products), 'extracted': len(frame),
                          'detail_visited': detail_visited, 'jsonld_found': jsonld_found,
-                         'meta_found': meta_found}
+                         'meta_found': meta_found, 'composition_html_found': composition_html_found,
+                         'composition_ocr_found': composition_ocr_found, 'ocr_notes': ocr_notes}
 
 
 def empty_frame():
@@ -301,6 +423,8 @@ def standardize(raw, source_name=''):
                  'source_category', 'season', 'category', 'collected_at', 'evidence']
     for col in text_cols:
         df[col] = df[col].map(clean_text)
+    # Repair legacy rows where the old version stored arbitrary descriptions in composition.
+    df['composition'] = df['composition'].map(composition_of)
     df['season'] = df.apply(
         lambda row: row['season'].upper() if re.fullmatch(r'20\d{2}(SS|FW)', row['season'].upper())
         else season_of(' '.join([row['season'], row['product_name'], row['product_id'], row['url']])), axis=1)
@@ -374,12 +498,12 @@ def report_html(df, season, notes):
     summary = group_stats(view)
     table = summary.to_html(index=False, border=0, na_rep='—', escape=True)
     bullets = ''.join('<li>' + escape(note) + '</li>' for note in notes)
-    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Menswear Intel v3.4</title>'
+    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Menswear Intel v3.5</title>'
             '<style>body{font-family:Arial,sans-serif;max-width:1080px;margin:40px auto;color:#20242b}'
             'h1{color:#12354b}table{border-collapse:collapse;width:100%;font-size:13px}'
             'td,th{padding:9px;border-bottom:1px solid #ddd;text-align:left}th{background:#e9f0f4}'
             '.muted{color:#777}</style></head><body>'
-            '<h1>Menswear Intel v3.4 | 시즌별 상품기획 리포트</h1>'
+            '<h1>Menswear Intel v3.5 | 시즌별 상품기획 리포트</h1>'
             '<p class="muted">시즌: ' + escape(season) + ' · 생성: ' + datetime.now().strftime('%Y-%m-%d %H:%M') + '</p>'
             '<h2>분석 범위</h2><p>확보 상품 ' + str(len(view)) + '개 · 브랜드 ' +
             str(view['brand'].nunique()) + '개 · 공개몰 표본 (전수조사 아님)</p>'
@@ -480,8 +604,8 @@ def add_public(frame):
         st.info('GitHub 연결이 없어 현재 세션에만 저장했습니다. CSV 백업을 이용해 주세요.')
 
 
-st.set_page_config(page_title='Menswear Intel v3.4 통합 전략', page_icon='📊', layout='wide')
-st.title('📊 Menswear Intel v3.4 | 통합 전략 분석')
+st.set_page_config(page_title='Menswear Intel v3.5 통합 전략', page_icon='📊', layout='wide')
+st.title('📊 Menswear Intel v3.5 | 통합 전략 분석')
 st.caption('공개몰 수집 → 데이터 누적·정제 → 경쟁사 비교 → 시즌별 기획 리포트')
 st.warning('공개 Streamlit 앱에는 사내 매출·원가·고객정보를 업로드하지 마세요. GitHub 자동 저장은 공개몰 수집 결과에만 적용됩니다.')
 
@@ -500,9 +624,11 @@ with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐
     pages = st.slider('최대 방문 페이지', 10, 200, 60, 10, key='v3_pages')
     delay = st.slider('요청 간 대기(초)', 1.0, 5.0, 1.5, .5, key='v3_delay')
     extra = st.text_area('추가 카테고리 URL (선택)', key='v3_extra')
+    use_ocr = st.checkbox('이미지 OCR 시도 (선택·느림·한국어 언어팩 필요)', value=False, key='v35_ocr')
+    st.caption('OCR은 HTML에 혼용률이 없을 때만 상세 이미지 최대 2장을 검사합니다. 결과는 반드시 원문 확인이 필요합니다.')
     if st.button('카테고리 우선 수집 실행', type='primary'):
         with st.spinner('공식몰 공개 페이지를 확인하고 있습니다...'):
-            data, logs, crawl_stats = crawl(brand, pages, delay, extra)
+            data, logs, crawl_stats = crawl(brand, pages, delay, extra, use_ocr=use_ocr)
         add_public(data)
         st.session_state['v3_logs'] = logs
         st.session_state['v3_stats'] = crawl_stats
@@ -513,6 +639,10 @@ with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐
         b.metric('신규 링크', crawl_stats['discovered'])
         c.metric('이번 추출 상품', crawl_stats['extracted'])
         st.caption(f"상품 상세 방문 {crawl_stats.get('detail_visited', 0)} / JSON-LD 발견 {crawl_stats.get('jsonld_found', 0)} / 메타태그 발견 {crawl_stats.get('meta_found', 0)}")
+        st.caption(f"HTML 혼용률 발견 {crawl_stats.get('composition_html_found', 0)} / 이미지 OCR 혼용률 발견 {crawl_stats.get('composition_ocr_found', 0)}")
+        if crawl_stats.get('ocr_notes'):
+            with st.expander('이미지 OCR 진단'):
+                st.code('\n'.join(crawl_stats['ocr_notes']))
         st.caption(f"남은 목록 {crawl_stats['listing_queue_remaining']} / 남은 상품 상세 {crawl_stats['product_queue_remaining']}")
         if crawl_stats['extracted'] == 0:
             st.info('상품 상세 페이지 방문 후에도 0건이면 사이트가 JavaScript/API로 데이터를 제공할 수 있습니다. 수집 로그와 상품 상세 URL을 확인해 주세요.')
@@ -583,8 +713,9 @@ if frames:
         b.metric('브랜드', view['brand'].nunique())
         c.metric('시즌 확인율', f"{(view['season'] != '미확인').mean():.0%}" if len(view) else '—')
         d.metric('가격 확보율', f"{view['price'].notna().mean():.0%}" if len(view) else '—')
+        st.caption('composition은 명시된 섬유 비율만 저장하며, 이미지 OCR 결과는 원문 검증이 필요합니다.')
         st.caption('품번이 없으면 URL, 상품명 순서로 중복 제거합니다. 동일 디자인의 컬러별 SKU는 별도 집계될 수 있습니다.')
-        st.dataframe(view[['brand','season','category','product_name','product_id','price','material','data_quality','url']],
+        st.dataframe(view[['brand','season','category','product_name','product_id','price','material','composition','data_quality','url']],
                      use_container_width=True, hide_index=True)
         if '닥스' in view['brand'].values and view['brand'].nunique() > 1:
             st.warning('닥스 6건은 특정 검색어의 편향 표본입니다. 다른 브랜드와 동등한 모집단으로 해석하지 마세요.')
