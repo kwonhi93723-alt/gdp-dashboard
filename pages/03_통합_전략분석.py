@@ -1,4 +1,4 @@
-"""Menswear Intel v3.3 — Streamlit page: pages/03_통합_전략분석.py."""
+"""Menswear Intel v3.4 — Streamlit page: pages/03_통합_전략분석.py."""
 import base64
 import io
 import json
@@ -32,7 +32,7 @@ CATEGORY_RULES = [
 ]
 MATERIALS = ['캐시미어', '울', '모헤어', '알파카', '린넨', '리넨', '면', '코튼', '실크',
              '폴리에스터', '나일론', '레이온', '비스코스', '스판', '라이오셀', '텐셀', '가죽', '스웨이드', '다운']
-HEADERS = {'User-Agent': 'MenswearIntelResearch/3.3 (public pages, low request rate)'}
+HEADERS = {'User-Agent': 'MenswearIntelResearch/3.4 (public pages, low request rate)'}
 REMOTE_PATH = 'data/menswear_public_products.csv'
 HISTORY_PATH = 'data/menswear_public_history.csv'
 
@@ -133,6 +133,35 @@ def extract(soup, url, brand, source_category):
     return rows
 
 
+
+def extract_product_meta(soup, url, brand, source_category):
+    """Conservative fallback for product detail pages lacking Product JSON-LD."""
+    def meta(*keys):
+        for key in keys:
+            tag = soup.find('meta', attrs={'property': key}) or soup.find('meta', attrs={'name': key})
+            if tag and tag.get('content'):
+                return tag['content'].strip()
+        return ''
+
+    title = meta('og:title', 'twitter:title')
+    price = meta('product:price:amount', 'og:price:amount', 'twitter:data1')
+    description = meta('og:description', 'description')
+    canonical = soup.find('link', rel='canonical')
+    product_url = urljoin(url, canonical.get('href')) if canonical and canonical.get('href') else url
+    # Do not invent products from listing/category pages or generic site titles.
+    if not title or not price or number(price) is None:
+        return []
+    if any(word in title.lower() for word in ['공식 온라인', '브랜드관', 'brand shop']):
+        return []
+    product_id = meta('product:retailer_item_id', 'product:sku')
+    material = ', '.join(m for m in MATERIALS if m in title + ' ' + description)
+    return [dict(brand=brand, season=season_of(' '.join([title, description, product_id, product_url])),
+                 category=category_of(source_category + ' ' + title), product_name=title,
+                 product_id=product_id, price=number(price), list_price=None,
+                 material=material, composition=description[:500], url=product_url,
+                 source_category=source_category, collected_at=datetime.now(timezone.utc).isoformat(),
+                 evidence='상품 상세 메타태그 (검증 필요)')]
+
 def in_domain(url, domain):
     parsed = urlparse(url)
     return parsed.scheme in ('http', 'https') and (parsed.hostname == domain or
@@ -159,6 +188,10 @@ def crawl(brand, max_pages=60, delay=1.5, extra=''):
     seen, queued = set(), {root}
     rows, logs = [], []
     links_found = 0
+    detail_visited = 0
+    jsonld_found = 0
+    meta_found = 0
+    listing_streak = 0
     for raw in extra.splitlines():
         url = urldefrag(raw.strip())[0]
         if in_domain(url, domain) and url not in queued:
@@ -167,7 +200,17 @@ def crawl(brand, max_pages=60, delay=1.5, extra=''):
     session = requests.Session()
     session.headers.update(HEADERS)
     while (listings or products) and len(seen) < max_pages:
-        url, source = listings.popleft() if listings else products.popleft()
+        # Visit product details after at most two listing pages.
+        take_product = bool(products) and (not listings or listing_streak >= 2)
+        if take_product:
+            url, source = products.popleft()
+            listing_streak = 0
+        else:
+            url, source = listings.popleft()
+            listing_streak += 1
+        is_detail = link_kind(url, brand) == 'product'
+        if is_detail:
+            detail_visited += 1
         if url in seen:
             continue
         seen.add(url)
@@ -184,6 +227,11 @@ def crawl(brand, max_pages=60, delay=1.5, extra=''):
                 continue
             soup = BeautifulSoup(response.text, 'html.parser')
             found = extract(soup, response.url, brand, source)
+            if found:
+                jsonld_found += len(found)
+            elif is_detail:
+                found = extract_product_meta(soup, response.url, brand, source)
+                meta_found += len(found)
             rows.extend(found)
             discovered = 0
             for anchor in soup.select('a[href]'):
@@ -209,7 +257,9 @@ def crawl(brand, max_pages=60, delay=1.5, extra=''):
         frame = standardize(frame)[COLS]
     return frame, logs, {'visited': len(seen), 'discovered': links_found,
                          'listing_queue_remaining': len(listings),
-                         'product_queue_remaining': len(products), 'extracted': len(frame)}
+                         'product_queue_remaining': len(products), 'extracted': len(frame),
+                         'detail_visited': detail_visited, 'jsonld_found': jsonld_found,
+                         'meta_found': meta_found}
 
 
 def empty_frame():
@@ -324,12 +374,12 @@ def report_html(df, season, notes):
     summary = group_stats(view)
     table = summary.to_html(index=False, border=0, na_rep='—', escape=True)
     bullets = ''.join('<li>' + escape(note) + '</li>' for note in notes)
-    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Menswear Intel v3.3</title>'
+    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Menswear Intel v3.4</title>'
             '<style>body{font-family:Arial,sans-serif;max-width:1080px;margin:40px auto;color:#20242b}'
             'h1{color:#12354b}table{border-collapse:collapse;width:100%;font-size:13px}'
             'td,th{padding:9px;border-bottom:1px solid #ddd;text-align:left}th{background:#e9f0f4}'
             '.muted{color:#777}</style></head><body>'
-            '<h1>Menswear Intel v3.3 | 시즌별 상품기획 리포트</h1>'
+            '<h1>Menswear Intel v3.4 | 시즌별 상품기획 리포트</h1>'
             '<p class="muted">시즌: ' + escape(season) + ' · 생성: ' + datetime.now().strftime('%Y-%m-%d %H:%M') + '</p>'
             '<h2>분석 범위</h2><p>확보 상품 ' + str(len(view)) + '개 · 브랜드 ' +
             str(view['brand'].nunique()) + '개 · 공개몰 표본 (전수조사 아님)</p>'
@@ -430,8 +480,8 @@ def add_public(frame):
         st.info('GitHub 연결이 없어 현재 세션에만 저장했습니다. CSV 백업을 이용해 주세요.')
 
 
-st.set_page_config(page_title='Menswear Intel v3.3 통합 전략', page_icon='📊', layout='wide')
-st.title('📊 Menswear Intel v3.3 | 통합 전략 분석')
+st.set_page_config(page_title='Menswear Intel v3.4 통합 전략', page_icon='📊', layout='wide')
+st.title('📊 Menswear Intel v3.4 | 통합 전략 분석')
 st.caption('공개몰 수집 → 데이터 누적·정제 → 경쟁사 비교 → 시즌별 기획 리포트')
 st.warning('공개 Streamlit 앱에는 사내 매출·원가·고객정보를 업로드하지 마세요. GitHub 자동 저장은 공개몰 수집 결과에만 적용됩니다.')
 
@@ -445,7 +495,7 @@ if 'v3_remote_checked' not in st.session_state:
             st.warning(f'GitHub 저장 데이터 불러오기 실패: {type(exc).__name__}')
 
 with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐색)'):
-    st.caption('공식몰 HTML의 공개 Product JSON-LD만 수집합니다. 사이트 구조나 접근 제한에 따라 0건일 수 있으며 전체 상품 수집은 보장하지 않습니다.')
+    st.caption('공식몰 공개 HTML의 Product JSON-LD 및 상품 상세 메타태그를 확인합니다. JavaScript 전용 상품 정보는 수집되지 않을 수 있으며 전체 상품 수집은 보장하지 않습니다.')
     brand = st.selectbox('브랜드', list(BRANDS), key='v3_brand')
     pages = st.slider('최대 방문 페이지', 10, 200, 60, 10, key='v3_pages')
     delay = st.slider('요청 간 대기(초)', 1.0, 5.0, 1.5, .5, key='v3_delay')
@@ -462,7 +512,10 @@ with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐
         a.metric('방문 페이지', crawl_stats['visited'])
         b.metric('신규 링크', crawl_stats['discovered'])
         c.metric('이번 추출 상품', crawl_stats['extracted'])
+        st.caption(f"상품 상세 방문 {crawl_stats.get('detail_visited', 0)} / JSON-LD 발견 {crawl_stats.get('jsonld_found', 0)} / 메타태그 발견 {crawl_stats.get('meta_found', 0)}")
         st.caption(f"남은 목록 {crawl_stats['listing_queue_remaining']} / 남은 상품 상세 {crawl_stats['product_queue_remaining']}")
+        if crawl_stats['extracted'] == 0:
+            st.info('상품 상세 페이지 방문 후에도 0건이면 사이트가 JavaScript/API로 데이터를 제공할 수 있습니다. 수집 로그와 상품 상세 URL을 확인해 주세요.')
         with st.expander('수집 로그'):
             st.code('\n'.join(st.session_state.get('v3_logs', [])))
 
