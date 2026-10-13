@@ -1,4 +1,4 @@
-"""Menswear Intel v3.5 — Streamlit page: pages/03_통합_전략분석.py."""
+"""Menswear Intel v3.6 — Streamlit page: pages/03_통합_전략분석.py."""
 import base64
 import io
 import json
@@ -33,7 +33,7 @@ CATEGORY_RULES = [
 ]
 MATERIALS = ['캐시미어', '울', '모헤어', '알파카', '린넨', '리넨', '면', '코튼', '실크',
              '폴리에스터', '나일론', '레이온', '비스코스', '스판', '라이오셀', '텐셀', '가죽', '스웨이드', '다운']
-HEADERS = {'User-Agent': 'MenswearIntelResearch/3.5 (public pages, low request rate)'}
+HEADERS = {'User-Agent': 'MenswearIntelResearch/3.6 (public pages, low request rate)'}
 REMOTE_PATH = 'data/menswear_public_products.csv'
 HISTORY_PATH = 'data/menswear_public_history.csv'
 
@@ -150,56 +150,81 @@ def detail_text(soup):
     return ' '.join(chunks)[:250000]
 
 
-def image_composition(soup, page_url, session, max_images=2):
-    """Optional last resort. Requires Pillow, pytesseract and Korean Tesseract data.
-
-    Only scan a few images from a user-initiated crawl, never all page images.
-    """
+def ocr_environment():
+    """Return a user-visible diagnosis without crashing the Streamlit page."""
     try:
         import pytesseract
-        from PIL import Image, ImageOps
-        if 'kor' not in pytesseract.get_languages(config=''):
-            return '', '한국어 OCR 언어팩(kor) 없음'
-    except (ImportError, OSError):
-        return '', 'OCR 의존성 없음 (Pillow/pytesseract/Tesseract kor)'
+        from PIL import Image  # noqa: F401
+        langs = pytesseract.get_languages(config='')
+        if 'kor' not in langs:
+            return False, 'Tesseract 실행 가능하지만 한국어 kor 언어 데이터가 없습니다. packages.txt에 tesseract-ocr-kor를 추가하세요.'
+        return True, '준비됨 (Tesseract 한국어 kor + Pillow + pytesseract)'
+    except ImportError as exc:
+        return False, f'Python OCR 패키지 없음: {exc.name}. requirements.txt에 Pillow, pytesseract를 추가하세요.'
+    except Exception as exc:
+        return False, f'Tesseract 실행 또는 언어 데이터 확인 실패: {type(exc).__name__}: {str(exc)[:180]}'
+
+
+def image_composition(soup, page_url, session, max_images=5):
+    """OCR likely description images, never assume the first product photo has text.
+
+    Return (composition, diagnostic). OCR output must be verified against the source.
+    """
+    ready, status = ocr_environment()
+    if not ready:
+        return '', status
+    import pytesseract
+    from PIL import Image, ImageOps
+
     candidates = []
-    for tag in soup.select('img[src], img[data-src], img[data-original]'):
-        src = tag.get('data-original') or tag.get('data-src') or tag.get('src') or ''
+    for tag in soup.select('img, source'):
+        src = (tag.get('data-original') or tag.get('data-src') or
+               tag.get('data-lazy-src') or tag.get('src') or '')
+        if not src and tag.get('srcset'):
+            src = tag['srcset'].split(',')[0].strip().split(' ')[0]
         target = urljoin(page_url, src)
-        if urlsplit(target).scheme not in ('https', 'http'):
+        if not src or urlsplit(target).scheme not in ('https', 'http'):
             continue
-        if target not in candidates:
-            candidates.append(target)
-    checked = 0
-    for target in candidates:
-        if checked >= max_images:
+        # Only fetch images from the official mall or its referenced CDN over HTTPS.
+        if urlsplit(target).scheme != 'https':
+            continue
+        label = ' '.join([src, tag.get('alt', ''), tag.get('class', [''])[0] if tag.get('class') else '']).lower()
+        score = sum(3 for word in ('detail', 'desc', 'content', 'fabric', 'material', 'spec', '상세', '소재') if word in label)
+        score -= sum(2 for word in ('thumb', 'logo', 'icon', 'banner', 'recommend', 'review') if word in label)
+        if target not in [entry[1] for entry in candidates]:
+            candidates.append((score, target))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    scanned = 0
+    notes = []
+    for score, target in candidates[:max_images * 5]:
+        if scanned >= max_images:
             break
         try:
-            # Image requests are bounded; avoid downloading unbounded assets.
-            response = session.get(target, timeout=10, stream=True)
-            response.raise_for_status()
-            if not response.headers.get('Content-Type', '').lower().startswith('image/'):
-                response.close()
-                continue
-            payload = bytearray()
-            for chunk in response.iter_content(chunk_size=65536):
-                payload.extend(chunk)
-                if len(payload) > 4_000_000:
-                    break
-            response.close()
-            if len(payload) > 4_000_000:
+            with session.get(target, timeout=12, stream=True) as response:
+                response.raise_for_status()
+                if not response.headers.get('Content-Type', '').lower().startswith('image/'):
+                    continue
+                payload = bytearray()
+                for chunk in response.iter_content(chunk_size=65536):
+                    payload.extend(chunk)
+                    if len(payload) > 8_000_000:
+                        break
+            if len(payload) > 8_000_000:
+                notes.append('이미지 크기 제한 초과')
                 continue
             image = Image.open(io.BytesIO(payload))
-            if image.width < 500 or image.height < 300 or image.width * image.height > 15_000_000:
+            if image.width < 450 or image.height < 250 or image.width * image.height > 24_000_000:
                 continue
-            checked += 1
-            text = pytesseract.image_to_string(ImageOps.grayscale(image), lang='kor+eng', timeout=12)
+            scanned += 1
+            gray = ImageOps.autocontrast(ImageOps.grayscale(image))
+            text = pytesseract.image_to_string(gray, lang='kor+eng', config='--psm 11', timeout=20)
             found = composition_of(text)
             if found:
-                return found, f'OCR 이미지 {checked}개 검사 후 발견 (원문 확인 필요)'
-        except Exception:
-            continue
-    return '', f'OCR 이미지 {checked}개 검사, 혼용률 미발견'
+                return found, f'OCR 성공: 후보 {len(candidates)}개 / 검사 {scanned}개 / {found} (원문 검증 필요)'
+        except Exception as exc:
+            if len(notes) < 3:
+                notes.append(f'{type(exc).__name__}: {str(exc)[:75]}')
+    return '', f'OCR 미발견: 이미지 후보 {len(candidates)}개 / 검사 {scanned}개' + (' / 오류 ' + '; '.join(notes) if notes else '')
 
 
 def extract(soup, url, brand, source_category):
@@ -296,11 +321,14 @@ def crawl(brand, max_pages=60, delay=1.5, extra='', use_ocr=False):
     composition_html_found = 0
     composition_ocr_found = 0
     ocr_notes = []
-    listing_streak = 0
+    listing_streak = 2 if extra.strip() else 0
     for raw in extra.splitlines():
         url = urldefrag(raw.strip())[0]
         if in_domain(url, domain) and url not in queued:
-            listings.append((url, '사용자 지정'))
+            if link_kind(url, brand) == 'product':
+                products.appendleft((url, '사용자 지정 상세'))
+            else:
+                listings.appendleft((url, '사용자 지정'))
             queued.add(url)
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -498,12 +526,12 @@ def report_html(df, season, notes):
     summary = group_stats(view)
     table = summary.to_html(index=False, border=0, na_rep='—', escape=True)
     bullets = ''.join('<li>' + escape(note) + '</li>' for note in notes)
-    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Menswear Intel v3.5</title>'
+    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Menswear Intel v3.6</title>'
             '<style>body{font-family:Arial,sans-serif;max-width:1080px;margin:40px auto;color:#20242b}'
             'h1{color:#12354b}table{border-collapse:collapse;width:100%;font-size:13px}'
             'td,th{padding:9px;border-bottom:1px solid #ddd;text-align:left}th{background:#e9f0f4}'
             '.muted{color:#777}</style></head><body>'
-            '<h1>Menswear Intel v3.5 | 시즌별 상품기획 리포트</h1>'
+            '<h1>Menswear Intel v3.6 | 시즌별 상품기획 리포트</h1>'
             '<p class="muted">시즌: ' + escape(season) + ' · 생성: ' + datetime.now().strftime('%Y-%m-%d %H:%M') + '</p>'
             '<h2>분석 범위</h2><p>확보 상품 ' + str(len(view)) + '개 · 브랜드 ' +
             str(view['brand'].nunique()) + '개 · 공개몰 표본 (전수조사 아님)</p>'
@@ -604,8 +632,8 @@ def add_public(frame):
         st.info('GitHub 연결이 없어 현재 세션에만 저장했습니다. CSV 백업을 이용해 주세요.')
 
 
-st.set_page_config(page_title='Menswear Intel v3.5 통합 전략', page_icon='📊', layout='wide')
-st.title('📊 Menswear Intel v3.5 | 통합 전략 분석')
+st.set_page_config(page_title='Menswear Intel v3.6 통합 전략', page_icon='📊', layout='wide')
+st.title('📊 Menswear Intel v3.6 | 통합 전략 분석')
 st.caption('공개몰 수집 → 데이터 누적·정제 → 경쟁사 비교 → 시즌별 기획 리포트')
 st.warning('공개 Streamlit 앱에는 사내 매출·원가·고객정보를 업로드하지 마세요. GitHub 자동 저장은 공개몰 수집 결과에만 적용됩니다.')
 
@@ -624,8 +652,11 @@ with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐
     pages = st.slider('최대 방문 페이지', 10, 200, 60, 10, key='v3_pages')
     delay = st.slider('요청 간 대기(초)', 1.0, 5.0, 1.5, .5, key='v3_delay')
     extra = st.text_area('추가 카테고리 URL (선택)', key='v3_extra')
-    use_ocr = st.checkbox('이미지 OCR 시도 (선택·느림·한국어 언어팩 필요)', value=False, key='v35_ocr')
-    st.caption('OCR은 HTML에 혼용률이 없을 때만 상세 이미지 최대 2장을 검사합니다. 결과는 반드시 원문 확인이 필요합니다.')
+    use_ocr = st.checkbox('상세 이미지 한국어 OCR 사용 (혼용률이 없을 때만)', value=False, key='v36_ocr')
+    if use_ocr:
+        ocr_ready, ocr_status = ocr_environment()
+        (st.success if ocr_ready else st.warning)('OCR 환경: ' + ocr_status)
+    st.caption('OCR은 HTML에 혼용률이 없을 때만 우선순위가 높은 상세 이미지 최대 5장을 검사합니다. 결과는 반드시 원문 확인이 필요합니다.')
     if st.button('카테고리 우선 수집 실행', type='primary'):
         with st.spinner('공식몰 공개 페이지를 확인하고 있습니다...'):
             data, logs, crawl_stats = crawl(brand, pages, delay, extra, use_ocr=use_ocr)
@@ -640,6 +671,8 @@ with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐
         c.metric('이번 추출 상품', crawl_stats['extracted'])
         st.caption(f"상품 상세 방문 {crawl_stats.get('detail_visited', 0)} / JSON-LD 발견 {crawl_stats.get('jsonld_found', 0)} / 메타태그 발견 {crawl_stats.get('meta_found', 0)}")
         st.caption(f"HTML 혼용률 발견 {crawl_stats.get('composition_html_found', 0)} / 이미지 OCR 혼용률 발견 {crawl_stats.get('composition_ocr_found', 0)}")
+        if use_ocr and not crawl_stats.get('ocr_notes'):
+            st.info('OCR 실행 기록 없음: 추출 상품이 없거나 HTML에서 이미 혼용률을 찾았을 수 있습니다.')
         if crawl_stats.get('ocr_notes'):
             with st.expander('이미지 OCR 진단'):
                 st.code('\n'.join(crawl_stats['ocr_notes']))
