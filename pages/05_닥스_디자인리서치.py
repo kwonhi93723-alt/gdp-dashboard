@@ -330,6 +330,7 @@ if "v5_df" in st.session_state:
 st.info("안전한 별도 페이지입니다. 기존 수집 코드와 GitHub DB를 수정하지 않습니다. 데이터는 CSV/Excel로 내려받아 검토 후 병합하세요. 이미지 저작권 및 각 사이트 이용 조건을 확인하세요.")
 
 
+
 # 실제 검증 상품 데이터
 st.divider()
 st.subheader("실제 상품 조사 데이터")
@@ -347,13 +348,38 @@ try:
 
     st.success(f"등록된 조사 상품: {len(verified_df)}개")
 
+    filter_columns = [
+        col for col in ["브랜드", "시즌", "유형"]
+        if col in verified_df.columns
+    ]
+
+    filtered_df = verified_df.copy()
+
+    for col in filter_columns:
+        options = sorted(
+            filtered_df[col].dropna().astype(str).unique().tolist()
+        )
+        selected = st.multiselect(
+            f"{col} 필터", options,
+            default=options,
+            key=f"verified_{col}"
+        )
+        filtered_df = filtered_df[
+            filtered_df[col].astype(str).isin(selected)
+        ]
+
+    config = {}
+    for col in filtered_df.columns:
+        if "URL" in col or "링크" in col:
+            config[col] = st.column_config.LinkColumn(col)
+        elif "이미지" in col or "사진" in col:
+            config[col] = st.column_config.ImageColumn(col)
+
     st.dataframe(
-        verified_df,
+        filtered_df,
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "출처URL": st.column_config.LinkColumn("상품 상세 링크")
-        },
+        column_config=config
     )
 
 except Exception as e:
