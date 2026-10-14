@@ -122,7 +122,20 @@ def search_google_cse(query,limit,logs):
   r=requests.get('https://www.googleapis.com/customsearch/v1',params={'key':key,'cx':cx,'q':query,'num':min(10,limit)},timeout=15)
   r.raise_for_status()
   return [(clean(x.get('title')),x.get('link',''),clean(x.get('snippet')),'Google CSE') for x in r.json().get('items',[]) if safe_url(x.get('link',''))]
- except requests.RequestException as e:logs.append('Google 검색 API 실패: '+type(e).__name__);return []
+ except requests.HTTPError as e:
+  status = e.response.status_code if e.response is not None else '알 수 없음'
+  reason = ''
+  if e.response is not None:
+   try:
+    payload = e.response.json().get('error', {})
+    reason = str(payload.get('message', ''))[:350]
+   except (ValueError, AttributeError, TypeError):
+    reason = 'Google 오류 본문 해석 불가'
+  logs.append(f'Google 검색 API 실패: HTTP {status} / {reason or "원인 설명 없음"}')
+  return []
+ except requests.RequestException as e:
+  logs.append('Google 검색 API 통신 실패: '+type(e).__name__)
+  return []
 
 def discover(brand,years,per_query,delay,logs):
  found=[]; queries=[]
