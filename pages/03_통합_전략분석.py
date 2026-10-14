@@ -1,4 +1,4 @@
-"""Menswear Intel v3.7 — Streamlit page: pages/03_통합_전략분석.py."""
+"""Menswear Intel v3.8 — Streamlit page: pages/03_통합_전략분석.py."""
 import base64
 import io
 import json
@@ -150,6 +150,30 @@ def detail_text(soup):
     return ' '.join(chunks)[:250000]
 
 
+
+def fabric_composition(soup):
+    """Prioritize nearby Fabric/소재 text when it is present in fetched HTML."""
+    pattern = re.compile(r'^(?:fabric|소재|혼용률|섬유\s*혼용률|제품\s*소재)$', re.I)
+    for tag in soup.find_all(['h2','h3','h4','strong','b','dt','th','p','div','span']):
+        label = tag.get_text(' ', strip=True)
+        if not label or len(label) > 24 or not pattern.fullmatch(label):
+            continue
+        snippets = []
+        for sibling in list(tag.next_siblings)[:5]:
+            snippets.append(sibling.get_text(' ', strip=True) if hasattr(sibling, 'get_text') else str(sibling))
+        if tag.parent:
+            snippets.append(tag.parent.get_text(' ', strip=True)[:1200])
+        found = composition_of(' '.join(snippets))
+        if found:
+            return found, 'Fabric/소재 HTML 영역'
+    # The browser screenshot can show text which is absent from requests HTML.
+    text = soup.get_text(' ', strip=True)
+    for match in re.finditer(r'(?<![A-Za-z])(?:Fabric|혼용률)(?![A-Za-z])', text, re.I):
+        found = composition_of(text[match.end():match.end()+450])
+        if found:
+            return found, 'Fabric 주변 HTML(검증 필요)'
+    return '', ''
+
 def ocr_environment():
     """Return a user-visible diagnosis without crashing the Streamlit page."""
     try:
@@ -165,7 +189,7 @@ def ocr_environment():
         return False, f'Tesseract 실행 또는 언어 데이터 확인 실패: {type(exc).__name__}: {str(exc)[:180]}'
 
 
-def image_composition(soup, page_url, session, max_images=20):
+def image_composition(soup, page_url, session, max_images=10):
     """Read explicit fiber percentages from publicly linked product-detail images.
 
     OCR is evidence to review, not a verified composition label.
@@ -252,9 +276,9 @@ def image_composition(soup, page_url, session, max_images=20):
                     scale = min(2.5, 1100 / band.width)
                     band = band.resize((int(band.width * scale), int(band.height * scale)))
                 gray = ImageOps.autocontrast(ImageOps.grayscale(band))
-                variants = [gray, ImageEnhance.Contrast(gray).enhance(2.0)]
+                variants = [gray]
                 for variant in variants:
-                    for psm in (6, 11):
+                    for psm in (11,):
                         try:
                             raw = pytesseract.image_to_string(
                                 variant, lang='kor+eng', config=f'--psm {psm}', timeout=12)
@@ -422,12 +446,18 @@ def crawl(brand, max_pages=60, delay=1.5, extra='', use_ocr=False):
                 page_text = detail_text(soup)
                 for record in found:
                     if not record.get('composition'):
+                        comp, origin = fabric_composition(soup)
+                        if comp:
+                            record['composition'] = comp
+                            record['evidence'] += ' + ' + origin
+                            composition_html_found += 1
+                    if not record.get('composition'):
                         record['composition'] = composition_of(page_text)
                         if record['composition']:
-                            record['evidence'] += ' + 상세 HTML 혼용률'
+                            record['evidence'] += ' + 상세 HTML 혼용률(검증 필요)'
                             composition_html_found += 1
                     if not record.get('composition') and use_ocr:
-                        comp, note = image_composition(soup, response.url, session, max_images=20)
+                        comp, note = image_composition(soup, response.url, session, max_images=10)
                         if comp:
                             record['composition'] = comp
                             record['evidence'] += ' + 이미지 OCR(검증 필요)'
@@ -579,12 +609,12 @@ def report_html(df, season, notes):
     summary = group_stats(view)
     table = summary.to_html(index=False, border=0, na_rep='—', escape=True)
     bullets = ''.join('<li>' + escape(note) + '</li>' for note in notes)
-    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Menswear Intel v3.7</title>'
+    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Menswear Intel v3.8</title>'
             '<style>body{font-family:Arial,sans-serif;max-width:1080px;margin:40px auto;color:#20242b}'
             'h1{color:#12354b}table{border-collapse:collapse;width:100%;font-size:13px}'
             'td,th{padding:9px;border-bottom:1px solid #ddd;text-align:left}th{background:#e9f0f4}'
             '.muted{color:#777}</style></head><body>'
-            '<h1>Menswear Intel v3.7 | 시즌별 상품기획 리포트</h1>'
+            '<h1>Menswear Intel v3.8 | 시즌별 상품기획 리포트</h1>'
             '<p class="muted">시즌: ' + escape(season) + ' · 생성: ' + datetime.now().strftime('%Y-%m-%d %H:%M') + '</p>'
             '<h2>분석 범위</h2><p>확보 상품 ' + str(len(view)) + '개 · 브랜드 ' +
             str(view['brand'].nunique()) + '개 · 공개몰 표본 (전수조사 아님)</p>'
@@ -685,8 +715,8 @@ def add_public(frame):
         st.info('GitHub 연결이 없어 현재 세션에만 저장했습니다. CSV 백업을 이용해 주세요.')
 
 
-st.set_page_config(page_title='Menswear Intel v3.7 통합 전략', page_icon='📊', layout='wide')
-st.title('📊 Menswear Intel v3.7 | 통합 전략 분석')
+st.set_page_config(page_title='Menswear Intel v3.8 통합 전략', page_icon='📊', layout='wide')
+st.title('📊 Menswear Intel v3.8 | 통합 전략 분석')
 st.caption('공개몰 수집 → 데이터 누적·정제 → 경쟁사 비교 → 시즌별 기획 리포트')
 st.warning('공개 Streamlit 앱에는 사내 매출·원가·고객정보를 업로드하지 마세요. GitHub 자동 저장은 공개몰 수집 결과에만 적용됩니다.')
 
@@ -705,11 +735,11 @@ with st.expander('① 경쟁사 공식몰 추가 수집 (카테고리 우선 탐
     pages = st.slider('최대 방문 페이지', 10, 200, 60, 10, key='v3_pages')
     delay = st.slider('요청 간 대기(초)', 1.0, 5.0, 1.5, .5, key='v3_delay')
     extra = st.text_area('추가 카테고리 URL (선택)', key='v3_extra')
-    use_ocr = st.checkbox('상세 이미지 한국어 OCR 사용 (혼용률이 없을 때만)', value=False, key='v37_ocr')
+    use_ocr = st.checkbox('상세 이미지 한국어 OCR 사용 (혼용률이 없을 때만)', value=False, key='v38_ocr')
     if use_ocr:
         ocr_ready, ocr_status = ocr_environment()
         (st.success if ocr_ready else st.warning)('OCR 환경: ' + ocr_status)
-    st.caption('OCR은 HTML에 혼용률이 없을 때만 우선순위가 높은 상세 이미지 최대 20장을 검사합니다. 긴 상세 이미지는 구간별로 OCR을 수행하므로 시간이 걸릴 수 있습니다. 결과는 반드시 원문 확인이 필요합니다.')
+    st.caption('OCR은 HTML에 혼용률이 없을 때만 우선순위가 높은 상세 HTML의 Fabric/소재를 먼저 찾고, 없으면 상세 이미지 최대 10장을 검사합니다. 결과는 반드시 원문 확인이 필요합니다.')
     if st.button('카테고리 우선 수집 실행', type='primary'):
         with st.spinner('공식몰 공개 페이지를 확인하고 있습니다...'):
             data, logs, crawl_stats = crawl(brand, pages, delay, extra, use_ocr=use_ocr)
